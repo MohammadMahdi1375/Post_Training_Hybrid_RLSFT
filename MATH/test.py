@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = '0, 1'
+os.environ["CUDA_VISIBLE_DEVICES"] = '6, 7'
 
 import os, re, json, glob, math, time
 from typing import List, Dict, Any, Optional
@@ -14,9 +14,9 @@ from vllm.lora.request import LoRARequest
 ###### "Qwen/Qwen2.5-0.5B-Instruct"
 ###### "/home/mohammad-m/TTT/Post-Training/MATH/saved_model/merged/"
 ###### "/home/mohammad-m/TTT/Post-Training/MATH/saved_model/qwen25_05b_sft_model/"
-MODEL_PATH     = os.environ.get("MODEL_PATH", "/home/mohammad-m/TTT/saved_model/MATH/sft_lora_FT_1/")
+MODEL_PATH     = os.environ.get("MODEL_PATH", "/home/mohammad-m/TTT/saved_model/MATH/merged_1/")
 DATA_DIR       = os.environ.get("DATA_DIR", "/home/mohammad-m/TTT/Post_Training_Hybrid_RLSFT/MATH/data")
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", 512))
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", 1024))
 BATCH_SIZE     = int(os.environ.get("BATCH_SIZE", 1))     # prompts per vLLM generate() call
 TEMPERATURE    = float(os.environ.get("TEMPERATURE", 0.0))
 TOP_P          = float(os.environ.get("TOP_P", 1.0))
@@ -28,8 +28,8 @@ TP_SIZE        = int(os.environ.get("TP_SIZE", 1))         # vLLM tensor paralle
 MAX_MODEL_LEN  = int(os.environ.get("MAX_MODEL_LEN", 4096))
 DTYPE          = os.environ.get("DTYPE", "float32")       # "bfloat16" or "float16"
 
-SYSTEM_PROMPT = "You are a helpful math tutor. Solve step by step, and put the final answer in \\boxed{...}."
-
+# SYSTEM_PROMPT = "You are a helpful math tutor. Solve step by step, and put the final answer in \\boxed{...}."
+SYSTEM_PROMPT = "You are a helpful math tutor. Show steps clearly."
 def read_json_or_jsonl(path):
     out = []
     with open(path, "r", encoding="utf-8") as f:
@@ -122,9 +122,13 @@ def approx_equal(a: str, b: str, tol: float = 1e-6) -> bool:
     return False
 
 def build_prompt(tok, problem: str) -> str:
+    # messages = [
+    #     {"role": "system", "content": SYSTEM_PROMPT},
+    #     {"role": "user", "content": f"Solve the following problem:\n\n{problem}"},
+    # ]
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Solve the following problem:\n\n{problem}"},
+        {"role": "system", "content": "You are a helpful math tutor. Show steps clearly."},
+        {"role": "user", "content": f"Solve step by step. Write 'Reasoning:' with steps, then 'Final Answer: \\boxed{...}'.\n\nProblem: {problem}"},
     ]
     # Render Qwen chat template, then pass plain text prompt to vLLM
     return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)

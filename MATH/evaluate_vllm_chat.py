@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = '0, 1'
+os.environ["CUDA_VISIBLE_DEVICES"] = '2, 3'
 
 import os, re, json, glob, math, time
 from typing import List, Dict, Any, Optional
@@ -14,9 +14,9 @@ from vllm.lora.request import LoRARequest
 ###### "Qwen/Qwen2.5-0.5B-Instruct"
 ###### "/home/mohammad-m/TTT/saved_model/MATH/merged/"
 ###### "/home/mohammad-m/TTT/saved_model/MATH/qwen25_05b_sft_model/"
-MODEL_PATH     = os.environ.get("MODEL_PATH", "/home/mohammad-m/TTT/saved_model/MATH/merged_1/")
+MODEL_PATH     = os.environ.get("MODEL_PATH", "/home/mohammad-m/TTT/saved_model/MATH/sft_FT_1/")
 DATA_DIR       = os.environ.get("DATA_DIR", "/home/mohammad-m/TTT/Post_Training_Hybrid_RLSFT/MATH/data")
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", 512))
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", 1024))
 BATCH_SIZE     = int(os.environ.get("BATCH_SIZE", 64))     # prompts per vLLM generate() call
 TEMPERATURE    = float(os.environ.get("TEMPERATURE", 0.0))
 TOP_P          = float(os.environ.get("TOP_P", 1.0))

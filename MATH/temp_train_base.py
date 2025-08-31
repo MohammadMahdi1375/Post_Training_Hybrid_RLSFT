@@ -41,14 +41,15 @@ DATA_DIR    = os.environ.get("DATA_DIR", "/home/mohammad-m/TTT/Post_Training_Hyb
 TRAIN_FILE  = os.environ.get("TRAIN_FILE", "train_data.json")   # inside DATA_DIR
 SPLIT_PCT = float(os.environ.get("SPLIT_PCT", "0.05"))  # 5% val from train
 
-OUTPUT_DIR  = os.environ.get("OUTPUT_DIR", "/home/mohammad-m/TTT/saved_model/MATH/sft_lora_FT_1")
+OUTPUT_DIR  = os.environ.get("OUTPUT_DIR", "/home/mohammad-m/TTT/saved_model/MATH/sft_FT_1")
 
 # training knobs
 EPOCHS      = int(os.environ.get("EPOCHS", "1"))
 LR          = float(os.environ.get("LR", "1e-7"))
+FREEZE_RATE = float(os.environ.get("FREEZE_RATE", "0.5"))
 BSZ         = int(os.environ.get("BSZ", "4"))      # per-device
 GR_ACC      = int(os.environ.get("GR_ACC", "16"))  # raise to reach effective batch
-MAX_LEN     = int(os.environ.get("MAX_LEN", "512"))
+MAX_LEN     = int(os.environ.get("MAX_LEN", "1024"))
 PACKING     = os.environ.get("PACKING", "0") == "1"
 WARMUP      = float(os.environ.get("WARMUP", "0.05"))
 LOG_STEPS   = int(os.environ.get("LOG_STEPS", "5"))
@@ -292,18 +293,14 @@ def main():
         trust_remote_code=True,
     )
 
-    # PEFT LoRA
-    lora = LoraConfig(
-        r=LORA_R,
-        lora_alpha=LORA_ALPHA,
-        lora_dropout=LORA_DROPOUT,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=[
-            "q_proj","k_proj","v_proj","o_proj",
-            "up_proj","down_proj","gate_proj",
-        ],
-    )
+    print(model)
+    blocks = model.model.layers
+    cutt_off = int(FREEZE_RATE * len(blocks))
+
+    for i, block in enumerate(blocks):
+        if i < cutt_off:
+            for p in block.parameters():
+                p.requires_grad = False
 
 
 
@@ -332,17 +329,12 @@ def main():
         remove_unused_columns=False,         # <-- keep labels in the batch
     )
 
-    # collator = AnswerOnlyLossCollator(tokenizer, MAX_LEN)
-
     trainer = SFTTrainer(
         model=model,
         processing_class=tokenizer,
         train_dataset=train_ds,
         eval_dataset=val_ds,
-        # peft_config=lora,
         args=sft_cfg,
-        # data_collator=collator,            # <-- use our collator
-        # dataset_text_field="text",         # we pre-rendered `text`
     )
 
 

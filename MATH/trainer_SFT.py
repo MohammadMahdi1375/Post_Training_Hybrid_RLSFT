@@ -42,14 +42,14 @@ TRAIN_FILE  = os.environ.get("TRAIN_FILE", "train_data.json")   # inside DATA_DI
 SPLIT_PCT = float(os.environ.get("SPLIT_PCT", "0.05"))  # 5% val from train
 
 OUTPUT_DIR  = os.environ.get("OUTPUT_DIR", "/home/mohammad-m/TTT/saved_model/MATH/sft_lora_1")
-MERGED_DIR  = os.environ.get("MERGED_DIR", "/home/mohammad-m/TTT/saved_model/MATH/merged_1")
+MERGED_DIR  = os.environ.get("MERGED_DIR", "/home/mohammad-m/TTT/saved_model/MATH/sft_merged_1")
 
 # training knobs
 EPOCHS      = int(os.environ.get("EPOCHS", "1"))
-LR          = float(os.environ.get("LR", "1e-4"))
+LR          = float(os.environ.get("LR", "1e-5"))
 BSZ         = int(os.environ.get("BSZ", "4"))      # per-device
 GR_ACC      = int(os.environ.get("GR_ACC", "16"))  # raise to reach effective batch
-MAX_LEN     = int(os.environ.get("MAX_LEN", "2048"))
+MAX_LEN     = int(os.environ.get("MAX_LEN", "1024"))
 PACKING     = os.environ.get("PACKING", "0") == "1"
 WARMUP      = float(os.environ.get("WARMUP", "0.05"))
 LOG_STEPS   = int(os.environ.get("LOG_STEPS", "5"))
