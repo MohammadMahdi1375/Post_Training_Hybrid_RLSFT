@@ -10,7 +10,7 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${file}",
-            "python": "/home/mohammad-m/.conda/envs/myenv/bin/python"
+            "python": "/home/mohammad-m/.conda/envs/Jamba/bin/python"
         }
     ]
 }

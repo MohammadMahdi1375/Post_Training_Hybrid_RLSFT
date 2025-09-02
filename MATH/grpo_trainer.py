@@ -23,10 +23,10 @@ from trl import GRPOConfig, GRPOTrainer
 # --------------------------
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-0.5B-Instruct")
 DATA_FILE  = os.environ.get("TRAIN_FILE", "/home/mohammad-m/TTT/Post_Training_Hybrid_RLSFT/MATH/data/train_data.json")
-OUT_DIR    = os.environ.get("OUTPUT_DIR", "../saved_model/out_grpo_qwen_math")
+OUT_DIR    = os.environ.get("OUTPUT_DIR", "../saved_model/MATH/out_grpo_qwen_math")
 
 LR         = float(os.environ.get("LR", "5e-6"))
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "4"))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "2"))
 ACCUM      = int(os.environ.get("GRAD_ACCUM", "2"))
 MAX_STEPS  = int(os.environ.get("MAX_STEPS", "1875"))
 
@@ -49,7 +49,7 @@ model = AutoModelForCausalLM.from_pretrained(
 
 model.generation_config = GenerationConfig(
     do_sample=True,     # GRPO benefits from sampling
-    temperature=0.7,
+    temperature=1,
     top_p=0.95,
     eos_token_id=tok.eos_token_id,
     pad_token_id=tok.pad_token_id,
@@ -104,8 +104,6 @@ split = ds_all.train_test_split(test_size=0.05, seed=42)
 # --------------------------
 # In TRL 0.21.x, GRPO calls: reward_func(samples: List[str], **kwargs)
 # It also forwards the original batch as kwargs["batch"] (dict of columns).
-boxed_re = re.compile(r"\\boxed\{([^{}]+)\}")
-
 boxed_re = re.compile(r"\\boxed\{([^{}]+)\}")
 def _boxed(s: str) -> str:
     m = boxed_re.search(s.replace(" ", ""))

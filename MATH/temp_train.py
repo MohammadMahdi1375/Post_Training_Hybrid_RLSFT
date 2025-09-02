@@ -1,269 +1,294 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# Prompt–completion SFT for Qwen/Qwen2.5-0.5B-Instruct (TRL 0.21.x, HF 4.55.4)
-# Dataset rows: {"problem": str, "solution": str[, "level": str/int, "type": str]}
-# Produces {"prompt": <chat-prompt>, "completion": <assistant text ending with <|im_end|>>}
+"""
+GRPO Post-Training for Qwen/Qwen2.5-0.5B-Instruct on MATH data.
 
-import os, json, glob
-from typing import Dict, Any, List, Optional
+- Uses TRL 0.21.0, Transformers 4.55.4, PEFT >= 0.10
+- V100 friendly (fp16), LoRA optional.
+- Dataset format: JSON with keys: idx, problem, solution, answer
+"""
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
 
+
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")  # avoid CUDA+fork issues
+
+
+import os, json, re
+from typing import List, Dict, Any
+import math, os, torch
 import torch
 from datasets import Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from trl import SFTTrainer, SFTConfig
+from transformers import GenerationConfig
+from trl import GRPOConfig, GRPOTrainer
 
-# -----------------------------
+# --------------------------
 # Config (override via env)
-# -----------------------------
-MODEL_NAME   = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-0.5B-Instruct")
-DATA_DIR     = os.environ.get("DATA_DIR", "/home/mohammad-m/TTT/Post_Training_Hybrid_RLSFT/MATH/data")
-TRAIN_FILE   = os.environ.get("TRAIN_FILE", "train_data.json")  # inside DATA_DIR
-OUTPUT_DIR   = os.environ.get("OUTPUT_DIR", "/home/mohammad-m/TTT/saved_model/MATH/qwen25_05b_sft_lora_prompt_completion")
+# --------------------------
+MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-0.5B-Instruct")
+DATA_FILE  = os.environ.get("TRAIN_FILE", "/home/mohammad-m/TTT/Post_Training_Hybrid_RLSFT/MATH/data/train_data.json")
+OUT_DIR    = os.environ.get("OUTPUT_DIR", "../saved_model/MATH/out_grpo_qwen_math")
 
-MAX_LEN      = int(os.environ.get("MAX_SEQ_LEN", 2048))
-TRAIN_BS     = int(os.environ.get("TRAIN_BS", 4))
-EVAL_BS      = int(os.environ.get("EVAL_BS", 1))
-GRAD_ACCUM   = int(os.environ.get("GRAD_ACCUM", 16))
-EPOCHS       = float(os.environ.get("EPOCHS", 1))
-LR           = float(os.environ.get("LR", 1e-5))
-WARMUP       = float(os.environ.get("WARMUP_RATIO", 0.03))
-WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", 0.01))
-LOG_STEPS    = int(os.environ.get("LOG_STEPS", 25))
-SAVE_STEPS   = int(os.environ.get("SAVE_STEPS", 500))
-EVAL_STEPS   = int(os.environ.get("EVAL_STEPS", 500))
+LR         = float(os.environ.get("LR", "5e-6"))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "2"))
+ACCUM      = int(os.environ.get("GRAD_ACCUM", "2"))
+NUM_EPOCHS = float(os.environ.get("NUM_EPOCHS", "3"))
 
-BF16         = os.environ.get("BF16", "0") == "1"   # keep False on V100
-PACKING      = os.environ.get("PACKING", "0") == "1"
+MAX_PROMPT_TOKENS     = int(os.environ.get("MAX_PROMPT_TOKENS", "768"))
+MAX_COMPLETION_TOKENS = int(os.environ.get("MAX_COMPLETION_TOKENS", "1024"))
+GROUP_SIZE            = int(os.environ.get("GROUP_SIZE", "4"))  # goes to Trainer (not Config) on 0.21.x
 
-# Optional filtering
-FILTER_LEVELS = os.environ.get("FILTER_LEVELS")  # e.g. "1,2,3"
-ONLY_EASY     = os.environ.get("ONLY_EASY", "0") == "1"   # < 4
-ONLY_HARD     = os.environ.get("ONLY_HARD", "0") == "1"   # >= 4
-DEV_SPLIT_PCT = float(os.environ.get("DEV_SPLIT_PCT", 0.05))  # last 5% as eval
 
-# LoRA / QLoRA
-USE_LORA     = os.environ.get("USE_LORA", "1") == "1"
-LOAD_4BIT    = os.environ.get("LOAD_4BIT", "0") == "1"
-LORA_R       = int(os.environ.get("LORA_R", 32))
-LORA_ALPHA   = int(os.environ.get("LORA_ALPHA", 64))
-LORA_DROPOUT = float(os.environ.get("LORA_DROPOUT", 0.05))
-LORA_TARGET  = os.environ.get(
-    "LORA_TARGET", "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
-).split(",")
 
-SYSTEM_PROMPT = "You are a helpful math tutor. Solve step by step, and put the final answer in \\boxed{...}."
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def read_json_or_jsonl(path: str) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8") as f:
-        text = f.read()
-        # naive detection of jsonl
-        if text.strip().startswith("{") and "\n{" in text:
-            for line in text.splitlines():
-                line = line.strip()
-                if line:
-                    out.append(json.loads(line))
-        else:
-            obj = json.loads(text)
-            if isinstance(obj, dict): out.append(obj)
-            elif isinstance(obj, list): out.extend(obj)
-            else: raise ValueError(f"Unsupported JSON in {path}")
-    return out
 
-def level_to_int(level_str: Any) -> int:
-    try:
-        s = str(level_str).strip()
-        # handle "Level 3" or "3"
-        toks = s.split()
-        return int(toks[-1]) if toks else 0
-    except Exception:
-        return 0
 
-def apply_filters(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if FILTER_LEVELS:
-        keep = {int(x) for x in FILTER_LEVELS.split(",")}
-        rows = [r for r in rows if level_to_int(r.get("level", "")) in keep]
-    if ONLY_EASY:
-        rows = [r for r in rows if level_to_int(r.get("level", "")) < 4]
-    if ONLY_HARD:
-        rows = [r for r in rows if level_to_int(r.get("level", "")) >= 4]
-    return rows
 
-def load_rows(data_dir: str, filename: str) -> List[Dict[str, Any]]:
-    files = sorted(glob.glob(os.path.join(data_dir, filename)))
-    if not files:
-        raise FileNotFoundError(f"No file '{filename}' found in {data_dir}")
-    rows: List[Dict[str, Any]] = []
-    for fp in files:
+W_CORRECT       = float(os.environ.get("W_CORRECT", "2.0"))   # Final Answer Correctness
+W_BOX_COMPLY_Y  = float(os.environ.get("W_BOX_COMPLY_Y", "0.5"))  # Boxed present
+W_BOX_COMPLY_N  = float(os.environ.get("W_BOX_COMPLY_N", "0.5"))  # Boxed missing (penalty)
+W_LEN           = float(os.environ.get("W_LEN", "1.0"))       # Length shaping scale
+LEN_THRESHOLD   = int(os.environ.get("LEN_THRESHOLD", "64"))  # token threshold (>= encouraged)
+
+W_REASON        = float(os.environ.get("W_REASON", "1.0"))    # Intermediate reasoning shaping
+REASON_MAX_EQ   = int(os.environ.get("REASON_MAX_EQ", "6"))   # cap for '='/markers density
+
+
+
+# --------------------------
+# Load model / tokenizer
+# --------------------------
+tok = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+if tok.pad_token is None:
+    tok.pad_token = tok.eos_token
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    # torch_dtype=torch.float16,
+    device_map="auto",
+)
+
+model.generation_config = GenerationConfig(
+    do_sample=True,     # GRPO benefits from sampling
+    temperature=1,
+    top_p=0.95,
+    eos_token_id=tok.eos_token_id,
+    pad_token_id=tok.pad_token_id,
+)
+
+# --------------------------
+# Data loading/helpers
+# --------------------------
+def get_world_size() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size()
+    # Accelerate sets WORLD_SIZE; fall back to 1
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+
+def _read_json_any(path: str):
+    with open(path, "r") as f:
+        text = f.read().strip()
         try:
-            for r in read_json_or_jsonl(fp):
-                if "problem" in r and ("solution" in r or "answer" in r):
-                    if "solution" not in r and "answer" in r:
-                        r["solution"] = str(r["answer"])
-                    rows.append(r)
-        except Exception as e:
-            print(f"[warn] skipping {fp}: {e}")
-    print(f"Loaded {len(rows)} examples from {len(files)} file(s).")
-    return rows
+            # JSON array
+            data = json.loads(text)
+            if isinstance(data, dict):
+                data = [data]
+            return data
+        except Exception:
+            # JSONL
+            return [json.loads(line) for line in text.splitlines() if line.strip()]
 
-def to_prompt_completion(tokenizer, problem: str, solution: str) -> Dict[str, Any]:
-    """
-    Create a prompt that ends at the start of the assistant turn and
-    a completion that contains ONLY the assistant text, ending with <|im_end|>.
-    """
-    msgs = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": f"Solve the following problem:\n\n{problem}"},
+def build_prompt(problem: str) -> str:
+    # Instruction we want the model to always follow:
+    user_msg = (
+        "Solve the problem step by step. "
+        "Show your reasoning, and finish with the final answer in \\boxed{...}.\n\n"
+        f"Problem: {problem}"
+    )
+    messages = [
+        {"role": "system", "content": "You are a meticulous math tutor. Always show your work."},
+        {"role": "user", "content": user_msg},
     ]
-    prompt_text = tokenizer.apply_chat_template(
-        msgs, tokenize=False, add_generation_prompt=True  # leaves "...<|assistant|>\n"
-    )
+    return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-    # Ensure completion ends with Qwen's end-of-turn token.
-    im_end = "<|im_end|>"
-    completion = solution.strip()
-    if not completion.endswith(im_end):
-        completion = completion + im_end
+raw = _read_json_any(DATA_FILE)
 
-    return {"prompt": prompt_text, "completion": completion}
+# map → {prompt, answer}
+rows = []
+for ex in raw:
+    problem  = str(ex["problem"]).strip()
+    answer   = str(ex.get("answer", "")).strip()
+    solution = str(ex.get("solution", "")).strip()  # <-- keep ref reasoning
+    rows.append({
+        "prompt": build_prompt(problem),
+        "answer": answer,
+        "solution": solution,
+    })
+
+ds_all = Dataset.from_list(rows)
+split = ds_all.train_test_split(test_size=0.05, seed=42)
+
+# --------------------------
+# Reward function (0.21.x)
+# --------------------------
+# In TRL 0.21.x, GRPO calls: reward_func(samples: List[str], **kwargs)
+# It also forwards the original batch as kwargs["batch"] (dict of columns).
+boxed_re = re.compile(r"\\boxed\{([^{}]+)\}")
+
+def _boxed_last(s: str) -> str:
+    # use the **last** boxed expression, spaces ignored
+    matches = boxed_re.findall(s.replace(" ", ""))
+    return matches[-1] if matches else ""
+
+_reason_markers = ("thus", "therefore", "hence", "so", "then", "we obtain", "we get", "implies")
+
+def _clean_math_text(s: str) -> str:
+    s = s.lower()
+    # strip some LaTeX control noise but keep math-y chars
+    s = re.sub(r"\\[a-zA-Z]+", " ", s)           # \text, \frac, \begin, ...
+    s = re.sub(r"[^a-z0-9=+\-*/^()., ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _token_set(s: str):
+    # words, numbers, and individual math symbols as "tokens"
+    return set(re.findall(r"[a-z]+|\d+|[=+\-*/^()]", s))
+
+def _jaccard(a: set, b: set) -> float:
+    if not a and not b: return 1.0
+    if not a or not b:  return 0.0
+    inter = len(a & b); uni = len(a | b)
+    return inter / uni if uni else 0.0
+
+def _seq_ratio(a: str, b: str) -> float:
+    # difflib gives a 0..1 rough relevance signal
+    try:
+        import difflib
+        return difflib.SequenceMatcher(None, a, b).ratio()
+    except Exception:
+        return 0.0
+
+def reward_func(prompts, completions, answer=None, solution=None, **_):
+    # completions: list of lists of dicts (first candidate is used by TRL per-sample);
+    # we'll score **each** candidate list by its first element's 'content'.
+    texts = [
+        (c[0]["content"] if isinstance(c, list) and c and isinstance(c[0], dict) and "content" in c[0]
+         else (c[0] if isinstance(c, list) and c else str(c)))
+        for c in completions
+    ]
+
+    golds      = [str(a or "").strip().replace(" ", "") for a in (answer or [""] * len(texts))]
+    ref_sols   = [str(s or "") for s in (solution or [""] * len(texts))]
+
+    rewards = []
+    for txt, gold, ref_sol in zip(texts, golds, ref_sols):
+        r = 0.0
+
+        # ---------- (1) Final Answer Correctness ----------
+        boxed_val = _boxed_last(txt)
+        if boxed_val == gold:
+            r += W_CORRECT
+
+        # ---------- (2) Boxed-Format Compliance ----------
+        has_box = bool(boxed_re.search(txt))
+        r += (W_BOX_COMPLY_Y if has_box else -W_BOX_COMPLY_N)
+
+        # ---------- (3) Length Shaping (tokens) ----------
+        # Encourage >= LEN_THRESHOLD tokens; penalize shorter
+        # (uses tokenizer already loaded as `tok`)
+        try:
+            n_tokens = len(tok.encode(txt))
+        except Exception:
+            n_tokens = len(txt.split())
+        r += (W_LEN if n_tokens >= LEN_THRESHOLD else -W_LEN)
+
+        # ---------- (4) Intermediate Reasoning Shaping ----------
+        # Relevance/matching to the provided step-by-step solution.
+        # Combines: (a) difflib similarity, (b) Jaccard over mathy tokens,
+        # and (c) density of equations/markers (structure signal).
+        clean_gen = _clean_math_text(txt)
+        clean_ref = _clean_math_text(ref_sol)
+
+        seq_sim   = _seq_ratio(clean_gen, clean_ref)            # 0..1
+        jac_sim   = _jaccard(_token_set(clean_gen), _token_set(clean_ref))  # 0..1
+
+        s_lower   = clean_gen
+        marker_cnt = sum(m in s_lower for m in _reason_markers)
+        eq_cnt     = txt.count("=")
+        struct_density = min((marker_cnt + eq_cnt) / max(REASON_MAX_EQ, 1), 1.0)  # 0..1
+
+        # Weighted blend → 0..1 (center later to allow positive/negative shaping)
+        relevance = 0.5 * seq_sim + 0.3 * jac_sim + 0.2 * struct_density
+
+        # Center to [-1, +1] then scale → encourages match, discourages irrelevance
+        r += W_REASON * (2.0 * relevance - 1.0)
+
+        rewards.append(r)
+
+    return rewards
 
 
+# --------------------------
+# GRPO config (training args only)
+# --------------------------
+N = len(split["train"])                    # number of training examples
+WORLD_SIZE = get_world_size()              # # of processes/GPUs
+PER_DEVICE_BS = BATCH_SIZE                 # per-device microbatch
+ACCUM_STEPS = ACCUM                        # gradient_accumulation_steps
 
-# -----------------------------
-# Main
-# -----------------------------
-def main():
-    print("Loading tokenizer...")
-    tok = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True, use_fast=True)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-    tok.padding_side = "right"
+# HF Trainer logic in a nutshell:
+# len(train_dataloader) ≈ ceil(N / (PER_DEVICE_BS * WORLD_SIZE))
+microsteps_per_epoch = math.ceil(N / (PER_DEVICE_BS * WORLD_SIZE))
+steps_per_epoch = math.ceil(microsteps_per_epoch / ACCUM_STEPS)
 
-    print("Loading data + filters...")
-    rows = apply_filters(load_rows(DATA_DIR, TRAIN_FILE))
-
-    # split (last DEV_SPLIT_PCT as eval)
-    n = len(rows)
-    split = max(1, int((1.0 - DEV_SPLIT_PCT) * n))
-    train_rows, eval_rows = rows[:split], rows[split:]
-
-    print("Rendering prompt–completion pairs...")
-    def pack(rr: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        return [to_prompt_completion(tok, r["problem"], r["solution"]) for r in rr]
-
-    train_list = pack(train_rows)
-    eval_list  = pack(eval_rows)
+MAX_STEPS = int(NUM_EPOCHS * steps_per_epoch)
 
 
+grpo_cfg = GRPOConfig(
+    use_vllm=True,
+    vllm_mode="colocate",
+    learning_rate=LR,
+    per_device_train_batch_size=BATCH_SIZE,
+    gradient_accumulation_steps=ACCUM,
+    max_steps=MAX_STEPS,
+    logging_steps=10,
+    save_steps=500,
+    output_dir=OUT_DIR,
+    report_to="tensorboard",
+    fp16=True,
+    remove_unused_columns=False,  # keep "answer" available in the batch
+    max_prompt_length=MAX_PROMPT_TOKENS,
+    max_completion_length=MAX_COMPLETION_TOKENS,
+    num_generations =GROUP_SIZE,  # valid here (not in GRPOConfig) on 0.21.x
+    # use_vllm=True,
+    # vllm_mode="server",
+    # vllm_server_base_url="http://127.0.0.1:8000",
+    # Optional: steer vLLM sampling here (overrides defaults)
+    # temperature=0.7,
+    # top_p=0.95,
+)
 
-    train_ds = Dataset.from_list(train_list)
-    eval_ds  = Dataset.from_list(eval_list) if len(eval_list) else None
+# --------------------------
+# Trainer
+# --------------------------
+trainer = GRPOTrainer(
+    model=model,
+    processing_class=tok,
+    args=grpo_cfg,
+    train_dataset=split["train"],
+    eval_dataset=split["test"],
+    reward_funcs=reward_func,
+    # IMPORTANT in TRL 0.21.x:
+    # - No `formatting_func` here.
+    # - Provide generation and length controls directly to the trainer:
+    # Column used as the input prompt:
+)
 
-    print("Loading model...")
-    extra_kwargs = {}
-    if LOAD_4BIT:
-        from transformers import BitsAndBytesConfig
-        extra_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16 if BF16 else torch.float16,
-        )
+trainer.train()
+trainer.save_model(OUT_DIR)
+tok.save_pretrained(OUT_DIR)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        device_map="auto",
-        trust_remote_code=True,
-        attn_implementation=None,  # V100-safe
-        **extra_kwargs
-    )
-
-    # LoRA (optional)
-    peft_config = None
-    if USE_LORA:
-        from peft import LoraConfig
-        peft_config = LoraConfig(
-            r=LORA_R,
-            lora_alpha=LORA_ALPHA,
-            lora_dropout=LORA_DROPOUT,
-            target_modules=LORA_TARGET,
-            task_type="CAUSAL_LM",
-            bias="none",
-        )
-    else:
-        model.requires_grad_(True)
-        model.gradient_checkpointing_enable()
-
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total     = sum(p.numel() for p in model.parameters())
-    print(f"Trainable Parameters: [{trainable}/{total}]")
-
-    # --- TRL 0.21 SFT ---
-    # We pass a prompt–completion dataset and DO NOT provide a formatting function.
-    # This keeps it compatible with completion_only_loss=True.
-    sft_cfg = SFTConfig(
-        output_dir=OUTPUT_DIR,
-        num_train_epochs=EPOCHS,
-        per_device_train_batch_size=TRAIN_BS,
-        per_device_eval_batch_size=EVAL_BS,
-        gradient_accumulation_steps=GRAD_ACCUM,
-        learning_rate=LR,
-        warmup_ratio=WARMUP,
-        weight_decay=WEIGHT_DECAY,
-        logging_steps=LOG_STEPS,
-        eval_strategy="steps" if eval_ds is not None else "no",
-        eval_steps=EVAL_STEPS,
-        save_strategy="steps",
-        save_steps=SAVE_STEPS,
-        save_total_limit=2,
-        bf16=BF16,
-        fp16=(not BF16),
-        dataloader_num_workers=2,
-        report_to=[],
-        optim="adamw_torch",
-        max_grad_norm=1.0,
-        max_length=MAX_LEN,
-        packing=PACKING,
-        padding_free=False,            # safer on V100 when packing
-        completion_only_loss=True,     # <-- train only on completions
-        # NOTE: Don't set assistant_only_loss for prompt–completion datasets.
-    )
-
-    trainer = SFTTrainer(
-        model=model,
-        args=sft_cfg,
-        train_dataset=train_ds,
-        eval_dataset=eval_ds,
-        processing_class=tok,   # tokenizer
-        peft_config=peft_config,
-        # No formatting function, no collator override — TRL picks prompt–completion path.
-    )
-
-    print("Training...")
-    trainer.train()
-
-    print("Saving...")
-    trainer.save_model(OUTPUT_DIR)
-    tok.save_pretrained(OUTPUT_DIR)
-
-    # quick sanity generation
-    demo_prompt = tok.apply_chat_template(
-        [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": "Compute: 3^4 - 5\\cdot 8."}
-        ],
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    demo_inputs = tok(demo_prompt, return_tensors="pt").to(model.device)
-    with torch.no_grad():
-        out = model.generate(**demo_inputs, max_new_tokens=128, do_sample=False)
-    print("\n=== SAMPLE OUTPUT ===")
-    print(tok.decode(out[0], skip_special_tokens=False))
-
-if __name__ == "__main__":
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    main()
+print(f"✅ Done. Saved to: {OUT_DIR}")
