@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = '0, 1'
+os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 
 import os, re, json, glob, math, time
 from typing import List, Dict, Any, Optional
@@ -12,11 +12,19 @@ from vllm.lora.request import LoRARequest
 
 # ---- Config via env ----
 ###### "Qwen/Qwen2.5-0.5B-Instruct"
-###### "/home/mohammad-m/TTT/saved_model/MATH/merged/"
-###### "/home/mohammad-m/TTT/saved_model/MATH/qwen25_05b_sft_model/"
-MODEL_PATH     = os.environ.get("MODEL_PATH", "/home/mohammad-m/TTT/saved_model/out_grpo_qwen_math/")
+###### "meta-llama/Llama-3.2-1B"
+###### "Qwen/Qwen2.5-3B"
+###### "../saved_model/MATH/sft_merged_1"
+###### "../saved_model/MATH/sft_FT_1/"
+"""
+Qwen/Qwen2.5-0.5B
+meta-llama/Llama-3.2-1B
+Qwen/Qwen2.5-3B
+"""
+MODEL_PATH     = os.environ.get("MODEL_PATH", "../saved_model/MATH/qwen_mixed_H_merged_1_512_1e-5")
+MODEL_CONFIG   = int(os.environ.get("MODEL_CONFIG", 1)) ## 1: Qwen-2.5-0.5B ** 2) Llama-3.2-1B
 DATA_DIR       = os.environ.get("DATA_DIR", "/home/mohammad-m/TTT/Post_Training_Hybrid_RLSFT/MATH/data")
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", 1024))
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", 512))
 BATCH_SIZE     = int(os.environ.get("BATCH_SIZE", 64))     # prompts per vLLM generate() call
 TEMPERATURE    = float(os.environ.get("TEMPERATURE", 0.0))
 TOP_P          = float(os.environ.get("TOP_P", 1.0))
@@ -26,7 +34,7 @@ ONLY_EASY      = os.environ.get("ONLY_EASY", "0") == "1"
 ONLY_HARD      = os.environ.get("ONLY_HARD", "0") == "1"
 TP_SIZE        = int(os.environ.get("TP_SIZE", 1))         # vLLM tensor parallel size
 MAX_MODEL_LEN  = int(os.environ.get("MAX_MODEL_LEN", 4096))
-DTYPE          = os.environ.get("DTYPE", "float32")       # "bfloat16" or "float16"
+DTYPE          = os.environ.get("DTYPE", "float32")        # "bfloat16" or "float16"
 
 SYSTEM_PROMPT = "You are a helpful math tutor. Solve step by step, and put the final answer in \\boxed{...}."
 
@@ -134,6 +142,22 @@ def main():
     tok = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    
+    if MODEL_CONFIG == 2:
+        tok.chat_template = """{% for message in messages %}{% if loop.first %}{{ bos_token }}{% endif -%}
+            {% if message['role'] == 'system' -%}
+            <|start_header_id|>system<|end_header_id|>
+
+            {{ message['content'] }}<|eot_id|>
+            {% elif message['role'] == 'user' -%}
+            <|start_header_id|>user<|end_header_id|>
+
+            {{ message['content'] }}<|eot_id|>
+            {% elif message['role'] == 'assistant' -%}
+            <|start_header_id|>assistant<|end_header_id|>
+
+            {{ message['content'] if message['content'] is string else '' }}{% if message['content'] is string %}<|eot_id|>{% endif %}
+            {% endif %}{% endfor -%}"""
 
     # Initialize vLLM
     llm = LLM(
@@ -193,6 +217,12 @@ def main():
     for lvl in sorted(per_level_total.keys()):
         acc = (per_level_correct[lvl] / per_level_total[lvl])*100
         print(f"  {lvl:>8}: {acc:.2f}  ({per_level_correct[lvl]}/{per_level_total[lvl]})")
+    
+    print("==================================================================================")
+    print(f"Model: {MODEL_PATH}")
+    print(f"Max Tokens: {MAX_NEW_TOKENS}")
+    print("==================================================================================")
+
 
 if __name__ == "__main__":
     main()
